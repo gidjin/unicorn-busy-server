@@ -137,6 +137,7 @@ def apiStatus():
 def apiColor(color):
     global globalLastCalledApi
     globalLastCalledApi = '/api/color/' + color
+    switchOff()
     if color == 'red':
         blinkThread = threading.Thread(
           target=setColor, args=(255, 0, 0, 0.4, 0))
