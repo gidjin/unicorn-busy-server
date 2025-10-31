@@ -5,3 +5,5 @@ flask_cors
 gpiozero
 jsmin
 RPi.GPIO
+python-dotenv
+requests

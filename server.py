@@ -8,12 +8,35 @@ import math
 import colorsys
 from time import sleep
 from datetime import datetime
-from gpiozero import CPUTemperature
+try:
+	from gpiozero import CPUTemperature
+	GPIOZERO_AVAILABLE = True
+except ImportError:
+	GPIOZERO_AVAILABLE = False
+	print("gpiozero not available. CPU temperature will be mocked.")
 from lib.unicorn_wrapper import UnicornWrapper
 from flask import Flask, jsonify, make_response, request, send_from_directory
 from flask_cors import CORS
 from random import randint
 from jsmin import jsmin
+from dotenv import load_dotenv
+import requests
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Load webhook URLs from environment variables
+WEBHOOK_AVAILABLE = os.getenv('WEBHOOK_AVAILABLE', '')
+WEBHOOK_BUSY = os.getenv('WEBHOOK_BUSY', '')
+WEBHOOK_AWAY = os.getenv('WEBHOOK_AWAY', '')
+WEBHOOK_OFF = os.getenv('WEBHOOK_OFF', '')
+WEBHOOK_RAINBOW = os.getenv('WEBHOOK_RAINBOW', '')
+
+# Load startup mode from environment variable (default: RAINBOW)
+STARTUP_MODE = os.getenv('STARTUP_MODE', 'RAINBOW').upper()
+
+# Load port from environment variable (default: 5000)
+PORT = int(os.getenv('PORT', '5000'))
 
 blinkThread = None
 crntColors = None
@@ -31,6 +54,31 @@ unicorn = UnicornWrapper()
 
 # get the width and height of the hardware and set it to portrait if its not
 width, height = unicorn.getShape()
+
+
+def call_webhook(webhook_url, status):
+	"""
+	Call webhook asynchronously with a simple GET request.
+	Runs in a separate thread to avoid blocking the main request.
+	"""
+	if not webhook_url:
+		return
+
+	def _make_request():
+		try:
+			response = requests.get(webhook_url, timeout=5)
+			print(f"Webhook called for {status}: {response.status_code}")
+		except requests.exceptions.Timeout:
+			print(f"Webhook timeout for {status}: {webhook_url}")
+		except requests.exceptions.RequestException as e:
+			print(f"Webhook error for {status}: {str(e)}")
+		except Exception as e:
+			print(f"Unexpected webhook error for {status}: {str(e)}")
+
+	# Run webhook call in a separate thread (non-blocking)
+	webhook_thread = threading.Thread(target=_make_request)
+	webhook_thread.daemon = True
+	webhook_thread.start()
 
 
 class MyFlaskApp(Flask):
@@ -187,6 +235,7 @@ def apiOff():
 	crntColors = None
 	switchOff()
 	setTimestamp()
+	call_webhook(WEBHOOK_OFF, 'Off')
 	return make_response(jsonify({}))
 
 
@@ -234,6 +283,7 @@ def availableCall():
 	blinkThread.do_run = True
 	blinkThread.start()
 	setTimestamp()
+	call_webhook(WEBHOOK_AVAILABLE, 'Available')
 	return make_response(jsonify())
 
 @app.route('/api/busy', methods=['GET', 'POST'])
@@ -247,6 +297,7 @@ def busyCall():
 	blinkThread.do_run = True
 	blinkThread.start()
 	setTimestamp()
+	call_webhook(WEBHOOK_BUSY, 'Busy')
 	return make_response(jsonify())
 
 @app.route('/api/away', methods=['GET', 'POST'])
@@ -260,6 +311,7 @@ def awayCall():
 	blinkThread.do_run = True
 	blinkThread.start()
 	setTimestamp()
+	call_webhook(WEBHOOK_AWAY, 'Away')
 	return make_response(jsonify())
 
 @app.route('/api/reset', methods=['GET', 'POST'])
@@ -269,20 +321,34 @@ def resetCall():
 	return make_response(jsonify())
 
 
-@app.route('/api/rainbow', methods=['POST'])
+@app.route('/api/rainbow', methods=['GET', 'POST'])
 def apiDisplayRainbow():
 	global blinkThread, globalStatus, globalLastCalledApi
 	globalStatus = 'rainbow'
 	globalLastCalledApi = '/api/rainbow'
 	switchOff()
+
+	# Default values
+	brightness = None
+	speed = None
+
+	# Try to parse JSON if provided
 	data = request.get_data(as_text=True)
-	content = json.loads(jsmin(request.get_data(as_text=True)))
-	brightness = content.get('brightness', None)
-	speed = content.get('speed', None)
+	if data:
+		try:
+			content = json.loads(jsmin(data))
+			brightness = content.get('brightness', None)
+			speed = content.get('speed', None)
+		except (json.JSONDecodeError, ValueError):
+			pass  # Use defaults if JSON parsing fails
+
 	blinkThread = threading.Thread(target=displayRainbow, args=(brightness, speed, None))
 	blinkThread.do_run = True
 	blinkThread.start()
 	setTimestamp()
+	if brightness is None:
+		brightness = 0.5
+	call_webhook(WEBHOOK_RAINBOW, 'Rainbow')
 	return make_response(jsonify())
 
 
@@ -291,15 +357,20 @@ def apiStatus():
 	global globalStatusOverwrite, globalStatus, globalBlue, globalGreen, globalRed, globalBrightness, \
 		globalLastCalled, globalLastCalledApi, width, height, unicorn
 
-	cpu = CPUTemperature()
+	if GPIOZERO_AVAILABLE:
+		cpu = CPUTemperature()
+		cpu_temp = cpu.temperature
+	else:
+		cpu_temp = 42.0  # Mock temperature for testing
+
 	return jsonify({
-		'red': globalRed, 
+		'red': globalRed,
 		'green': globalGreen,
 		'blue': globalBlue,
 		'brightness': globalBrightness,
 		'lastCalled': globalLastCalled,
-		'cpuTemp': cpu.temperature,
-		'lastCalledApi': globalLastCalledApi, 
+		'cpuTemp': cpu_temp,
+		'lastCalledApi': globalLastCalledApi,
 		'height': height,
 		'width': width,
 		'unicorn': unicorn.getType(),
@@ -314,11 +385,39 @@ def not_found(error):
 
 
 def startupRainbow():
-	global blinkThread
-	blinkThread = threading.Thread(target=displayRainbow, args=(1, 0.1, 1))
-	blinkThread.do_run = True
-	blinkThread.start()
+	"""Initialize the display based on STARTUP_MODE environment variable"""
+	global blinkThread, globalStatus, globalStatusOverwrite
+
+	startup_mode = STARTUP_MODE
+	print(f"Starting up in {startup_mode} mode")
+
+	if startup_mode == 'OFF':
+		globalStatus = 'off'
+		switchOff()
+	elif startup_mode == 'AVAILABLE':
+		globalStatusOverwrite = True
+		globalStatus = 'Available'
+		blinkThread = threading.Thread(target=setColor, args=(0, 144, 0))
+		blinkThread.do_run = True
+		blinkThread.start()
+	elif startup_mode == 'BUSY':
+		globalStatusOverwrite = True
+		globalStatus = 'Busy'
+		blinkThread = threading.Thread(target=setColor, args=(179, 0, 0))
+		blinkThread.do_run = True
+		blinkThread.start()
+	elif startup_mode == 'AWAY':
+		globalStatusOverwrite = True
+		globalStatus = 'Away'
+		blinkThread = threading.Thread(target=setColor, args=(255, 191, 0))
+		blinkThread.do_run = True
+		blinkThread.start()
+	else:  # Default to RAINBOW
+		globalStatus = 'rainbow'
+		blinkThread = threading.Thread(target=displayRainbow, args=(1, 0.1, 1))
+		blinkThread.do_run = True
+		blinkThread.start()
 
 
 if __name__ == '__main__':
-	app.run(host='0.0.0.0', debug=False)
+	app.run(host='0.0.0.0', port=PORT, debug=False)
